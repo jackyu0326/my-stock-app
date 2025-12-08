@@ -68,7 +68,6 @@ def get_market_data(tickers):
 # --- 3. 產生 AI 建議總表 ---
 def generate_summary_table(data, tickers):
     summary_list = []
-    
     progress_bar = st.progress(0, text="分析中...")
     
     for i, t in enumerate(tickers):
@@ -97,17 +96,13 @@ def generate_summary_table(data, tickers):
             
             # D. AI 評分
             score = 0
-            
-            # RSI 評分
             if rsi < 30: score += 3
             elif rsi > 70: score -= 2
             else: score += 1
             
-            # 均線評分
             if current_price > ma_50: score += 3
             else: score -= 1
             
-            # PE 評分
             pe_str = "N/A"
             if pe:
                 pe_str = f"{pe:.1f}"
@@ -202,9 +197,57 @@ with col2:
             else:
                 st.warning("⚠️ 無法取得有效本益比數據")
 
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                row_heights=[0.7, 0.3], vertical_spacing=0.05,
-                                subplot_titles=(f'{target_ticker} K線圖', '成交量'))
+            # --- 繪圖區 (安全拆解版) ---
+            
+            # 1. 建立子圖框架
+            titles = (f'{target_ticker} K線圖', '成交量')
+            fig = make_subplots(
+                rows=2, 
+                cols=1, 
+                shared_xaxes=True, 
+                row_heights=[0.7, 0.3], 
+                vertical_spacing=0.05,
+                subplot_titles=titles
+            )
 
-            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
-                                         low=df['Low'], close=df['Close'], name
+            # 2. 準備 K 線圖資料
+            candle = go.Candlestick(
+                x=df.index, 
+                open=df['Open'], 
+                high=df['High'],
+                low=df['Low'], 
+                close=df['Close'], 
+                name='Price'
+            )
+            fig.add_trace(candle, row=1, col=1)
+            
+            # 3. 準備 50日均線資料
+            ma50 = df['Close'].rolling(50).mean()
+            ma_line = go.Scatter(
+                x=df.index, 
+                y=ma50, 
+                line=dict(color='orange', width=1.5), 
+                name='50 MA'
+            )
+            fig.add_trace(ma_line, row=1, col=1)
+
+            # 4. 準備成交量資料
+            # 判斷顏色：收盤 > 開盤 為綠，反之為紅
+            colors = ['green' if o < c else 'red' for o, c in zip(df['Open'], df['Close'])]
+            
+            volume_bar = go.Bar(
+                x=df.index, 
+                y=df['Volume'], 
+                marker_color=colors, 
+                name='Volume'
+            )
+            fig.add_trace(volume_bar, row=2, col=1)
+
+            # 5. 最終設定
+            fig.update_layout(
+                height=500, 
+                xaxis_rangeslider_visible=False, 
+                showlegend=False
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
