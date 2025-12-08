@@ -12,21 +12,39 @@ st.title('🇺🇸 美股 AI 戰情室 Pro')
 # 定義關注清單
 WATCHLIST = ["GOOG", "AAPL", "NVDA", "BRK-B", "MSFT", "AMZN", "META", "TSLA", "AMD", "TSM", "AVGO", "INTC"]
 
-# --- 1. 核心工具：本益比計算機 ---
+# --- 1. 核心工具：本益比計算機 (含 ADR 匯率修正) ---
 @st.cache_data(ttl=3600)
 def get_pe_ratio_robust(ticker_symbol, current_price):
     stock = yf.Ticker(ticker_symbol)
     pe = None
     
-    # 方法 A: 嘗試官方屬性
+    # [步驟 1] 嘗試官方屬性
     try:
-        if stock.info and stock.info.get('trailingPE'):
-            return stock.info['trailingPE']
+        info = stock.info
+        if info and info.get('trailingPE'):
+            return info['trailingPE']
     except:
-        pass
+        info = {}
 
-    # 方法 B: 手動挖季報
+    # [步驟 2] 手動計算 (含匯率處理)
     try:
+        # A. 判斷幣別
+        stock_currency = info.get('currency', 'USD')
+        fin_currency = info.get('financialCurrency', stock_currency)
+        exchange_rate = 1.0
+        
+        if stock_currency != fin_currency:
+            try:
+                currency_pair = f"{fin_currency}=X" 
+                rate_data = yf.Ticker(currency_pair).history(period="1d")
+                if not rate_data.empty:
+                    rate = rate_data['Close'].iloc[-1]
+                    if rate > 0:
+                        exchange_rate = rate
+            except:
+                pass 
+
+        # B. 抓取財報 EPS
         stmt = stock.quarterly_income_stmt
         if stmt.empty:
             stmt = stock.income_stmt
@@ -45,15 +63,21 @@ def get_pe_ratio_robust(ticker_symbol, current_price):
             if eps_row is not None:
                 vals = eps_row.values
                 vals = [v for v in vals if pd.notna(v) and v != 0]
+                
+                ttm_eps_raw = 0
                 if len(vals) >= 4:
-                    ttm_eps = sum(vals[:4])
+                    ttm_eps_raw = sum(vals[:4])
                 elif len(vals) > 0:
-                    ttm_eps = vals[0] * 4
-                else:
-                    ttm_eps = 0
+                    ttm_eps_raw = vals[0] * 4
 
-                if ttm_eps > 0:
-                    pe = current_price / ttm_eps
+                if ttm_eps_raw > 0:
+                    ttm_eps_adj = ttm_eps_raw / exchange_rate
+                    pe = current_price / ttm_eps_adj
+
+        # [步驟 3] 防呆 (過低的 PE視為異常)
+        if pe is not None and pe < 5:
+            pe = None
+            
     except:
         pass
 
@@ -112,7 +136,6 @@ def generate_summary_table(data, tickers):
             else:
                 score += 1
 
-            # E. 產生建議
             if score >= 7:
                 suggestion = "🟢 強力買進"
             elif score >= 4:
@@ -186,68 +209,75 @@ with col2:
                 df = pd.DataFrame()
 
         if not df.empty:
+            # 準備數據
             current_price = df['Close'].iloc[-1]
             pe = get_pe_ratio_robust(target_ticker, current_price)
             df['RSI'] = ta.rsi(df['Close'], length=14)
-            
-            st.markdown(f"## {target_ticker} - 現價: **${current_price:.2f}**")
-            
-            if pe:
-                st.info(f"📊 經計算，目前本益比 (P/E) 約為：**{pe:.2f}**")
-            else:
-                st.warning("⚠️ 無法取得有效本益比數據")
+            ma50 = df['Close'].rolling(50).mean()
+            current_rsi = df['RSI'].iloc[-1]
+            current_ma50 = ma50.iloc[-1] if not pd.isna(ma50.iloc[-1]) else 0
 
-            # --- 繪圖區 (安全拆解版) ---
+            st.markdown(f"## {target_ticker} - 現價: **${current_price:.2f}**")
+
+            # --- 恢復顯示詳細分析報告 ---
+            reasons = []
             
-            # 1. 建立子圖框架
+            # 1. RSI 分析
+            if current_rsi < 30:
+                reasons.append(f"✅ **RSI 技術面**: 數值為 {current_rsi:.1f} (超賣區)，短線反彈機率高。")
+            elif current_rsi > 70:
+                reasons.append(f"⚠️ **RSI 技術面**: 數值為 {current_rsi:.1f} (超買區)，過熱風險高。")
+            else:
+                reasons.append(f"ℹ️ **RSI 技術面**: 數值為 {current_rsi:.1f} (中性)，無極端訊號。")
+
+            # 2. 均線分析
+            if current_price > current_ma50:
+                reasons.append(f"✅ **均線趨勢**: 股價高於 50MA (${current_ma50:.2f})，呈現多頭排列。")
+            else:
+                reasons.append(f"⚠️ **均線趨勢**: 股價跌破 50MA (${current_ma50:.2f})，走勢轉弱。")
+
+            # 3. 本益比分析
+            if pe:
+                if pe < 25:
+                    reasons.append(f"✅ **估值 (P/E)**: 本益比 {pe:.1f} 倍，處於合理/低估區間。")
+                elif pe > 60:
+                    reasons.append(f"⚠️ **估值 (P/E)**: 本益比 {pe:.1f} 倍，估值相對較高。")
+                else:
+                    reasons.append(f"ℹ️ **估值 (P/E)**: 本益比 {pe:.1f} 倍，屬於正常範圍。")
+            else:
+                reasons.append("⚠️ **估值**: 無法取得有效本益比數據。")
+
+            # 使用 Expander 顯示
+            with st.expander("📊 點擊查看 AI 詳細分析報告 (RSI、均線、本益比)", expanded=True):
+                for r in reasons:
+                    st.write(r)
+
+            # --- 繪圖區 ---
             titles = (f'{target_ticker} K線圖', '成交量')
             fig = make_subplots(
-                rows=2, 
-                cols=1, 
-                shared_xaxes=True, 
-                row_heights=[0.7, 0.3], 
-                vertical_spacing=0.05,
+                rows=2, cols=1, shared_xaxes=True, 
+                row_heights=[0.7, 0.3], vertical_spacing=0.05,
                 subplot_titles=titles
             )
 
-            # 2. 準備 K 線圖資料
             candle = go.Candlestick(
-                x=df.index, 
-                open=df['Open'], 
-                high=df['High'],
-                low=df['Low'], 
-                close=df['Close'], 
-                name='Price'
+                x=df.index, open=df['Open'], high=df['High'],
+                low=df['Low'], close=df['Close'], name='Price'
             )
             fig.add_trace(candle, row=1, col=1)
             
-            # 3. 準備 50日均線資料
-            ma50 = df['Close'].rolling(50).mean()
             ma_line = go.Scatter(
-                x=df.index, 
-                y=ma50, 
-                line=dict(color='orange', width=1.5), 
-                name='50 MA'
+                x=df.index, y=ma50, 
+                line=dict(color='orange', width=1.5), name='50 MA'
             )
             fig.add_trace(ma_line, row=1, col=1)
 
-            # 4. 準備成交量資料
-            # 判斷顏色：收盤 > 開盤 為綠，反之為紅
             colors = ['green' if o < c else 'red' for o, c in zip(df['Open'], df['Close'])]
-            
             volume_bar = go.Bar(
-                x=df.index, 
-                y=df['Volume'], 
-                marker_color=colors, 
-                name='Volume'
+                x=df.index, y=df['Volume'], 
+                marker_color=colors, name='Volume'
             )
             fig.add_trace(volume_bar, row=2, col=1)
 
-            # 5. 最終設定
-            fig.update_layout(
-                height=500, 
-                xaxis_rangeslider_visible=False, 
-                showlegend=False
-            )
-            
+            fig.update_layout(height=500, xaxis_rangeslider_visible=False, showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
