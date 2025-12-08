@@ -69,7 +69,6 @@ def get_market_data(tickers):
 def generate_summary_table(data, tickers):
     summary_list = []
     
-    # 建立進度條
     progress_bar = st.progress(0, text="分析中...")
     
     for i, t in enumerate(tickers):
@@ -95,3 +94,117 @@ def generate_summary_table(data, tickers):
             
             # C. 基本面
             pe = get_pe_ratio_robust(t, current_price)
+            
+            # D. AI 評分
+            score = 0
+            
+            # RSI 評分
+            if rsi < 30: score += 3
+            elif rsi > 70: score -= 2
+            else: score += 1
+            
+            # 均線評分
+            if current_price > ma_50: score += 3
+            else: score -= 1
+            
+            # PE 評分
+            pe_str = "N/A"
+            if pe:
+                pe_str = f"{pe:.1f}"
+                if pe < 25: score += 4
+                elif pe > 60: score -= 2
+                else: score += 2
+            else:
+                score += 1
+
+            # E. 產生建議
+            if score >= 7:
+                suggestion = "🟢 強力買進"
+            elif score >= 4:
+                suggestion = "🟡 觀望/持有"
+            else:
+                suggestion = "🔴 建議賣出"
+
+            summary_list.append({
+                "代碼": t,
+                "現價": current_price,
+                "漲跌幅": change_pct / 100,
+                "RSI": rsi,
+                "本益比 (PE)": pe_str,
+                "AI 建議": suggestion,
+                "綜合評分": score,
+                "成交量": volume
+            })
+            
+        except Exception as e:
+            continue
+            
+    progress_bar.empty()
+    return pd.DataFrame(summary_list)
+
+# --- 主程式 ---
+
+with st.spinner('正在連線交易所...'):
+    market_data = get_market_data(WATCHLIST)
+
+if not market_data.empty:
+    st.subheader("📊 AI 投資建議總表")
+    df_summary = generate_summary_table(market_data, WATCHLIST)
+    
+    st.dataframe(
+        df_summary.style.format({
+            "現價": "${:.2f}",
+            "漲跌幅": "{:+.2%}",
+            "RSI": "{:.1f}",
+            "成交量": "{:,.0f}",
+            "綜合評分": "{:.0f}"
+        }).map(lambda x: 'color: green' if x > 0 else 'color: red', subset=['漲跌幅'])
+          .map(lambda x: 'background-color: #d4edda' if '買進' in str(x) else ('background-color: #f8d7da' if '賣出' in str(x) else ''), subset=['AI 建議']),
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.error("無法取得數據，請稍後再試。")
+
+st.divider()
+
+col1, col2 = st.columns([1, 3])
+
+with col1:
+    st.subheader("🔍 個股深度分析")
+    selected_ticker = st.selectbox("選擇股票", ["請選擇..."] + WATCHLIST + ["自行輸入"])
+    target_ticker = ""
+    if selected_ticker == "自行輸入":
+        target_ticker = st.text_input("輸入代碼", "PLTR").upper()
+    elif selected_ticker != "請選擇...":
+        target_ticker = selected_ticker
+
+with col2:
+    if target_ticker:
+        if target_ticker in WATCHLIST and target_ticker in market_data.columns.levels[0]:
+            df = market_data[target_ticker].copy()
+        else:
+            try:
+                stock_temp = yf.Ticker(target_ticker)
+                df = stock_temp.history(period="1y")
+            except:
+                df = pd.DataFrame()
+
+        if not df.empty:
+            current_price = df['Close'].iloc[-1]
+            pe = get_pe_ratio_robust(target_ticker, current_price)
+            df['RSI'] = ta.rsi(df['Close'], length=14)
+            
+            st.markdown(f"## {target_ticker} - 現價: **${current_price:.2f}**")
+            
+            if pe:
+                st.info(f"📊 經計算，目前本益比 (P/E) 約為：**{pe:.2f}**")
+            else:
+                st.warning("⚠️ 無法取得有效本益比數據")
+
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                row_heights=[0.7, 0.3], vertical_spacing=0.05,
+                                subplot_titles=(f'{target_ticker} K線圖', '成交量'))
+
+            fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
+                                         low=df['Low'], close=df['Close'], name
