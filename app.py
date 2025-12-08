@@ -1,0 +1,77 @@
+import streamlit as st
+import yfinance as yf
+import pandas_ta as ta
+
+# 1. 網站標題
+st.title('美股 AI 信心值分析儀表板')
+
+# 2. 輸入股票代碼
+ticker = st.text_input('請輸入美股代碼 (例如: AAPL, NVDA)', 'AAPL')
+
+if ticker:
+    # 3. 抓取數據
+    stock = yf.Ticker(ticker)
+    try:
+        # 取得歷史資料 (用來算技術指標)
+        df = stock.history(period="6mo")
+        # 取得即時價格與基本資料
+        info = stock.info
+        current_price = info.get('currentPrice', df['Close'].iloc[-1])
+        
+        st.metric(label="當前股價", value=f"${current_price}")
+
+        # --- 4. 核心邏輯：計算信心值 (範例) ---
+        confidence_score = 0
+        reasons = []
+
+        # 邏輯 A: RSI 指標 (技術面)
+        # 計算 14天 RSI
+        df['RSI'] = ta.rsi(df['Close'], length=14)
+        current_rsi = df['RSI'].iloc[-1]
+        
+        if current_rsi < 30:
+            confidence_score += 40
+            reasons.append(f"✅ RSI 過低 ({current_rsi:.1f})，處於超賣區，反彈機率高")
+        elif current_rsi > 70:
+            confidence_score -= 20
+            reasons.append(f"⚠️ RSI 過高 ({current_rsi:.1f})，處於超買區，風險高")
+        else:
+            confidence_score += 10
+            reasons.append(f"ℹ️ RSI 中性 ({current_rsi:.1f})")
+
+        # 邏輯 B: 本益比估值 (基本面)
+        pe_ratio = info.get('trailingPE')
+        if pe_ratio:
+            if pe_ratio < 20: # 假設 20倍以下算便宜 (這只是範例，不同產業標準不同)
+                confidence_score += 30
+                reasons.append(f"✅ 本益比 ({pe_ratio:.1f}) 低於 20，估值相對合理")
+            else:
+                reasons.append(f"ℹ️ 本益比 ({pe_ratio:.1f}) 偏高")
+        
+        # 邏輯 C: 股價位置 (簡單均線)
+        ma_50 = df['Close'].rolling(50).mean().iloc[-1]
+        if current_price > ma_50:
+            confidence_score += 30
+            reasons.append("✅ 股價位於 50日均線之上，趨勢偏多")
+
+        # --- 5. 顯示結果 ---
+        st.subheader(f"🤖 購入信心分數: {confidence_score} / 100")
+        
+        # 根據分數改變顏色
+        if confidence_score >= 70:
+            st.success("評級: 強力買入 (Strong Buy)")
+        elif confidence_score >= 40:
+            st.warning("評級: 觀望 / 持有 (Hold)")
+        else:
+            st.error("評級: 不建議購入 (Sell/Avoid)")
+
+        # 顯示分析原因
+        with st.expander("查看分析細節"):
+            for reason in reasons:
+                st.write(reason)
+
+        # 畫圖
+        st.line_chart(df['Close'])
+
+    except Exception as e:
+        st.error(f"找不到代碼或發生錯誤: {e}")
