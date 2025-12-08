@@ -12,37 +12,50 @@ st.title('🇺🇸 美股 AI 戰情室 Pro')
 # 定義關注清單
 WATCHLIST = ["GOOG", "AAPL", "NVDA", "BRK-B", "MSFT", "AMZN", "META", "TSLA", "AMD", "TSM", "AVGO", "INTC"]
 
-# --- 1. 核心工具：本益比計算機 (含 ADR 匯率修正) ---
+# --- 1. 核心工具：本益比計算機 (含 TSM/ADR 強力修復) ---
 @st.cache_data(ttl=3600)
 def get_pe_ratio_robust(ticker_symbol, current_price):
     stock = yf.Ticker(ticker_symbol)
     pe = None
     
-    # [步驟 1] 嘗試官方屬性
+    # [步驟 1] 優先嘗試官方屬性 (Trailing & Forward)
+    # Forward PE 通常在 Trailing PE 失敗時還能抓得到
     try:
         info = stock.info
-        if info and info.get('trailingPE'):
-            return info['trailingPE']
+        if info:
+            if info.get('trailingPE'):
+                return info['trailingPE']
+            elif info.get('forwardPE'):
+                return info['forwardPE']
     except:
         info = {}
 
-    # [步驟 2] 手動計算 (含匯率處理)
+    # [步驟 2] 手動計算 (強力備援)
     try:
-        # A. 判斷幣別
+        # A. 判斷幣別與 ADR 修正
         stock_currency = info.get('currency', 'USD')
         fin_currency = info.get('financialCurrency', stock_currency)
+        
+        # --- TSM 專屬暴力修復補丁 ---
+        # 如果 yfinance 抓不到 TSM 的幣別資訊，我們手動告訴它
+        if ticker_symbol == 'TSM' and fin_currency == 'USD': 
+            fin_currency = 'TWD'
+        # ---------------------------
+
         exchange_rate = 1.0
         
+        # 抓取匯率
         if stock_currency != fin_currency:
             try:
-                currency_pair = f"{fin_currency}=X" 
+                currency_pair = f"{fin_currency}=X" # 例如 TWD=X
                 rate_data = yf.Ticker(currency_pair).history(period="1d")
                 if not rate_data.empty:
                     rate = rate_data['Close'].iloc[-1]
                     if rate > 0:
                         exchange_rate = rate
             except:
-                pass 
+                # 如果抓不到匯率，針對 TSM 給一個粗略預設值 (避免除以 1 導致算錯)
+                if ticker_symbol == 'TSM': exchange_rate = 32.5 
 
         # B. 抓取財報 EPS
         stmt = stock.quarterly_income_stmt
@@ -61,6 +74,7 @@ def get_pe_ratio_robust(ticker_symbol, current_price):
                     break
             
             if eps_row is not None:
+                # 取最近 4 季 EPS 加總
                 vals = eps_row.values
                 vals = [v for v in vals if pd.notna(v) and v != 0]
                 
@@ -71,11 +85,24 @@ def get_pe_ratio_robust(ticker_symbol, current_price):
                     ttm_eps_raw = vals[0] * 4
 
                 if ttm_eps_raw > 0:
-                    ttm_eps_adj = ttm_eps_raw / exchange_rate
-                    pe = current_price / ttm_eps_adj
+                    # [ADR 換股修正]
+                    # TSM ADR 代表 5 股台股，所以 EPS 要先 * 5
+                    adr_multiplier = 1.0
+                    if ticker_symbol == 'TSM':
+                        adr_multiplier = 5.0
+                    
+                    # 計算公式: (原始EPS * ADR倍率) / 匯率
+                    ttm_eps_adj = (ttm_eps_raw * adr_multiplier) / exchange_rate
+                    
+                    if ttm_eps_adj > 0:
+                        pe = current_price / ttm_eps_adj
 
-        # [步驟 3] 防呆 (過低的 PE視為異常)
+        # [步驟 3] 最終防呆 (Sanity Check)
+        # 如果算出來還是 < 5 (除了嚴重虧損，不太可能)，嘗試最後一招：可能是匯率忘了除
         if pe is not None and pe < 5:
+            # 啟發式修正：如果 PE 只有 3.5，乘上 30 倍匯率變成 105，雖然偏高但比較合理?
+            # 這裡保守一點，如果真的算不出來，就回傳 None，避免誤導
+            # 但針對 TSM，如果我們上面的修正有效，應該不會掉入這裡
             pe = None
             
     except:
@@ -136,6 +163,7 @@ def generate_summary_table(data, tickers):
             else:
                 score += 1
 
+            # E. 建議
             if score >= 7:
                 suggestion = "🟢 強力買進"
             elif score >= 4:
@@ -219,10 +247,10 @@ with col2:
 
             st.markdown(f"## {target_ticker} - 現價: **${current_price:.2f}**")
 
-            # --- 恢復顯示詳細分析報告 ---
+            # --- 詳細分析報告 ---
             reasons = []
             
-            # 1. RSI 分析
+            # RSI 分析
             if current_rsi < 30:
                 reasons.append(f"✅ **RSI 技術面**: 數值為 {current_rsi:.1f} (超賣區)，短線反彈機率高。")
             elif current_rsi > 70:
@@ -230,13 +258,13 @@ with col2:
             else:
                 reasons.append(f"ℹ️ **RSI 技術面**: 數值為 {current_rsi:.1f} (中性)，無極端訊號。")
 
-            # 2. 均線分析
+            # 均線分析
             if current_price > current_ma50:
                 reasons.append(f"✅ **均線趨勢**: 股價高於 50MA (${current_ma50:.2f})，呈現多頭排列。")
             else:
                 reasons.append(f"⚠️ **均線趨勢**: 股價跌破 50MA (${current_ma50:.2f})，走勢轉弱。")
 
-            # 3. 本益比分析
+            # 本益比分析
             if pe:
                 if pe < 25:
                     reasons.append(f"✅ **估值 (P/E)**: 本益比 {pe:.1f} 倍，處於合理/低估區間。")
@@ -247,7 +275,6 @@ with col2:
             else:
                 reasons.append("⚠️ **估值**: 無法取得有效本益比數據。")
 
-            # 使用 Expander 顯示
             with st.expander("📊 點擊查看 AI 詳細分析報告 (RSI、均線、本益比)", expanded=True):
                 for r in reasons:
                     st.write(r)
