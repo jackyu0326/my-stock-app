@@ -4,6 +4,7 @@ import pandas_ta as ta
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
 
 # --- 網頁設定 ---
 st.set_page_config(page_title="美股戰情室 Pro", layout="wide")
@@ -12,14 +13,38 @@ st.title('🇺🇸 美股 AI 戰情室 Pro')
 # 定義關注清單
 WATCHLIST = ["GOOG", "AAPL", "NVDA", "BRK-B", "MSFT", "AMZN", "META", "TSLA", "AMD", "TSM", "AVGO", "INTC"]
 
-# --- 1. 核心工具：本益比計算機 (含 TSM/ADR 強力修復) ---
+# --- 0. 新增：智慧代碼搜尋引擎 ---
+@st.cache_data(ttl=3600)
+def search_symbol_yahoo(query):
+    """
+    輸入名字 (如 Qualcomm)，回傳最可能的代碼 (如 QCOM)。
+    使用 Yahoo Finance 的公開 Autocomplete API。
+    """
+    if not query: return None
+    try:
+        # 偽裝成瀏覽器
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        # 呼叫 Yahoo 搜尋建議 API
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=1&newsCount=0"
+        response = requests.get(url, headers=headers, timeout=5)
+        data = response.json()
+        
+        if 'quotes' in data and len(data['quotes']) > 0:
+            best_match = data['quotes'][0]
+            symbol = best_match.get('symbol')
+            longname = best_match.get('longname', symbol)
+            return symbol, longname
+    except Exception as e:
+        pass
+    return None, None
+
+# --- 1. 核心工具：本益比計算機 ---
 @st.cache_data(ttl=3600)
 def get_pe_ratio_robust(ticker_symbol, current_price):
     stock = yf.Ticker(ticker_symbol)
     pe = None
     
-    # [步驟 1] 優先嘗試官方屬性 (Trailing & Forward)
-    # Forward PE 通常在 Trailing PE 失敗時還能抓得到
+    # [步驟 1] 優先嘗試官方屬性
     try:
         info = stock.info
         if info:
@@ -30,31 +55,27 @@ def get_pe_ratio_robust(ticker_symbol, current_price):
     except:
         info = {}
 
-    # [步驟 2] 手動計算 (強力備援)
+    # [步驟 2] 手動計算
     try:
         # A. 判斷幣別與 ADR 修正
         stock_currency = info.get('currency', 'USD')
         fin_currency = info.get('financialCurrency', stock_currency)
         
-        # --- TSM 專屬暴力修復補丁 ---
-        # 如果 yfinance 抓不到 TSM 的幣別資訊，我們手動告訴它
+        # TSM 補丁
         if ticker_symbol == 'TSM' and fin_currency == 'USD': 
             fin_currency = 'TWD'
-        # ---------------------------
 
         exchange_rate = 1.0
         
-        # 抓取匯率
         if stock_currency != fin_currency:
             try:
-                currency_pair = f"{fin_currency}=X" # 例如 TWD=X
+                currency_pair = f"{fin_currency}=X"
                 rate_data = yf.Ticker(currency_pair).history(period="1d")
                 if not rate_data.empty:
                     rate = rate_data['Close'].iloc[-1]
                     if rate > 0:
                         exchange_rate = rate
             except:
-                # 如果抓不到匯率，針對 TSM 給一個粗略預設值 (避免除以 1 導致算錯)
                 if ticker_symbol == 'TSM': exchange_rate = 32.5 
 
         # B. 抓取財報 EPS
@@ -74,7 +95,6 @@ def get_pe_ratio_robust(ticker_symbol, current_price):
                     break
             
             if eps_row is not None:
-                # 取最近 4 季 EPS 加總
                 vals = eps_row.values
                 vals = [v for v in vals if pd.notna(v) and v != 0]
                 
@@ -85,24 +105,15 @@ def get_pe_ratio_robust(ticker_symbol, current_price):
                     ttm_eps_raw = vals[0] * 4
 
                 if ttm_eps_raw > 0:
-                    # [ADR 換股修正]
-                    # TSM ADR 代表 5 股台股，所以 EPS 要先 * 5
                     adr_multiplier = 1.0
-                    if ticker_symbol == 'TSM':
-                        adr_multiplier = 5.0
+                    if ticker_symbol == 'TSM': adr_multiplier = 5.0
                     
-                    # 計算公式: (原始EPS * ADR倍率) / 匯率
                     ttm_eps_adj = (ttm_eps_raw * adr_multiplier) / exchange_rate
-                    
                     if ttm_eps_adj > 0:
                         pe = current_price / ttm_eps_adj
 
-        # [步驟 3] 最終防呆 (Sanity Check)
-        # 如果算出來還是 < 5 (除了嚴重虧損，不太可能)，嘗試最後一招：可能是匯率忘了除
+        # [步驟 3] 防呆
         if pe is not None and pe < 5:
-            # 啟發式修正：如果 PE 只有 3.5，乘上 30 倍匯率變成 105，雖然偏高但比較合理?
-            # 這裡保守一點，如果真的算不出來，就回傳 None，避免誤導
-            # 但針對 TSM，如果我們上面的修正有效，應該不會掉入這裡
             pe = None
             
     except:
@@ -163,7 +174,6 @@ def generate_summary_table(data, tickers):
             else:
                 score += 1
 
-            # E. 建議
             if score >= 7:
                 suggestion = "🟢 強力買進"
             elif score >= 4:
@@ -218,15 +228,50 @@ col1, col2 = st.columns([1, 3])
 
 with col1:
     st.subheader("🔍 個股深度分析")
-    selected_ticker = st.selectbox("選擇股票", ["請選擇..."] + WATCHLIST + ["自行輸入"])
+    # 這裡的邏輯稍微修改，讓使用者體驗更好
+    input_mode = st.radio("選擇模式", ["清單選股", "🔍 智慧搜尋 (輸入代碼或公司名)"], horizontal=True)
+    
     target_ticker = ""
-    if selected_ticker == "自行輸入":
-        target_ticker = st.text_input("輸入代碼", "PLTR").upper()
-    elif selected_ticker != "請選擇...":
+    
+    if input_mode == "清單選股":
+        selected_ticker = st.selectbox("選擇股票", WATCHLIST)
         target_ticker = selected_ticker
+    else:
+        # 智慧搜尋模式
+        user_input = st.text_input("輸入股票代碼或公司名稱 (例如: Qualcomm, QCOM)", "QCOM")
+        
+        if user_input:
+            # 1. 先假設使用者輸入的是正確代碼 (轉大寫)
+            user_input_upper = user_input.upper().strip()
+            
+            # 判斷這是不是一個顯而易見的有效代碼 (例如已經在我們的清單裡)
+            if user_input_upper in WATCHLIST:
+                target_ticker = user_input_upper
+            else:
+                # 2. 如果不是清單內的，我們嘗試抓資料看看
+                # 這裡使用一個小技巧：如果抓不到資料，就啟動「智慧搜尋」
+                check_stock = yf.Ticker(user_input_upper)
+                try:
+                    # 快速檢查是否有歷史資料
+                    hist = check_stock.history(period="5d")
+                    if not hist.empty:
+                        target_ticker = user_input_upper
+                    else:
+                        raise Exception("No Data")
+                except:
+                    # 3. 抓不到資料 (可能是輸入了 Qualcomm)，啟動搜尋引擎
+                    with st.spinner(f"正在搜尋 '{user_input}' 對應的股票代碼..."):
+                        found_symbol, found_name = search_symbol_yahoo(user_input)
+                        
+                        if found_symbol:
+                            st.success(f"🔍 已自動將 '{user_input}' 修正為: **{found_symbol}** ({found_name})")
+                            target_ticker = found_symbol
+                        else:
+                            st.error(f"找不到 '{user_input}' 對應的股票。")
 
 with col2:
     if target_ticker:
+        # 嘗試取得資料
         if target_ticker in WATCHLIST and target_ticker in market_data.columns.levels[0]:
             df = market_data[target_ticker].copy()
         else:
@@ -237,7 +282,6 @@ with col2:
                 df = pd.DataFrame()
 
         if not df.empty:
-            # 準備數據
             current_price = df['Close'].iloc[-1]
             pe = get_pe_ratio_robust(target_ticker, current_price)
             df['RSI'] = ta.rsi(df['Close'], length=14)
@@ -308,3 +352,5 @@ with col2:
 
             fig.update_layout(height=500, xaxis_rangeslider_visible=False, showlegend=False)
             st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning(f"無法載入 {target_ticker} 的數據，請檢查代碼是否正確。")
