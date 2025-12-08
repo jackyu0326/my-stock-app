@@ -1,77 +1,87 @@
 import streamlit as st
 import yfinance as yf
 import pandas_ta as ta
+import pandas as pd
 
 # 設定網頁標題
 st.set_page_config(page_title="美股 AI 信心儀表板", layout="centered")
 st.title('美股 AI 信心值分析儀表板')
 
-# --- 1. 定義數據抓取函數 (維持原本的防擋機制) ---
-@st.cache_data(ttl=300) # 資料暫存 5分鐘
+# --- 1. 核心數據抓取函數 (含三層備援機制) ---
+@st.cache_data(ttl=300)
 def get_stock_data(ticker_symbol):
     try:
         stock = yf.Ticker(ticker_symbol)
         
-        # 抓取歷史資料
+        # A. 抓取歷史價格 (技術面用)
         df = stock.history(period="6mo")
-        
         if df.empty:
             return None, None, "抓取不到歷史股價，請確認代碼是否正確。"
             
-        # 抓取基本資料 (容錯處理)
-        try:
-            info = stock.info
-        except Exception:
-            info = {}
+        # B. 抓取基本資料 (嘗試多種來源)
+        info = {}
         
-        # 確保有當前價格
-        if not info or 'currentPrice' not in info:
+        # 1. 取得目前股價 (最優先使用 fast_info，最準且不被擋)
+        try:
+            current_price = stock.fast_info.last_price
+        except:
+            current_price = df['Close'].iloc[-1]
+        
+        info['currentPrice'] = current_price
+
+        # 2. 取得/計算 本益比 (PE Ratio) - 這是您原本卡關的地方
+        pe_ratio = None
+        
+        # 方法一：直接嘗試從 info 拿 (最近常失敗，但還是試試)
+        try:
+            raw_info = stock.info
+            if raw_info and 'trailingPE' in raw_info and raw_info['trailingPE'] is not None:
+                pe_ratio = raw_info['trailingPE']
+            elif raw_info and 'forwardPE' in raw_info and raw_info['forwardPE'] is not None:
+                pe_ratio = raw_info['forwardPE'] # 如果沒有過去PE，用未來PE頂替
+        except:
+            pass
+        
+        # 方法二：如果方法一失敗，手動計算 (Price / TTM EPS)
+        if pe_ratio is None:
             try:
-                current_price = stock.fast_info.last_price
-                info['currentPrice'] = current_price
-                info['trailingPE'] = None 
-            except:
-                info['currentPrice'] = df['Close'].iloc[-1]
-                info['trailingPE'] = None
+                # 抓取季報 (Income Statement)
+                financials = stock.quarterly_income_stmt
+                if not financials.empty:
+                    # 尋找 'Basic EPS' 這一列
+                    # 不同公司名稱可能微調，模糊搜尋
+                    eps_row = financials.loc[financials.index.str.contains('Basic EPS', case=False, na=False)]
+                    
+                    if not eps_row.empty:
+                        # 取最近 4 季的 EPS 加總 (= TTM EPS)
+                        last_4_quarters_eps = eps_row.iloc[0, :4].sum()
+                        if last_4_quarters_eps > 0:
+                            pe_ratio = current_price / last_4_quarters_eps
+            except Exception as e:
+                print(f"手動計算 PE 失敗: {e}")
+
+        info['trailingPE'] = pe_ratio
 
         return df, info, None
         
     except Exception as e:
         return None, None, str(e)
 
-# --- 2. 新增：股票選擇介面 ---
-
-# 定義預設清單
-default_stocks = [
-    "GOOG", "AAPL", "NVDA", "BRK-B", 
-    "MSFT", "AMZN", "META", "TSLA", 
-    "AMD", "TSM", "AVGO", "ORCL"
-]
-
-# 建立兩欄佈局 (選單左邊，輸入框右邊或是隱藏)
+# --- 2. 股票選擇介面 ---
+default_stocks = ["GOOG", "AAPL", "NVDA", "BRK-B", "MSFT", "AMZN", "META", "TSLA", "AMD", "TSM", "AVGO"]
 col1, col2 = st.columns([2, 1])
-
 with col1:
-    # 下拉選單
-    selection = st.selectbox(
-        "📝 請選擇股票：", 
-        ["請選擇..."] + default_stocks + ["🔍 自行輸入代碼"]
-    )
+    selection = st.selectbox("📝 請選擇股票：", ["請選擇..."] + default_stocks + ["🔍 自行輸入代碼"])
 
 ticker = ""
-
-# 根據選擇決定 ticker
 if selection == "🔍 自行輸入代碼":
     with col2:
-        user_input = st.text_input("輸入代碼", "INTC")
-        ticker = user_input.upper()
+        ticker = st.text_input("輸入代碼", "INTC").upper()
 elif selection != "請選擇...":
     ticker = selection
 
-# --- 3. 主程式邏輯 (開始分析) ---
-
+# --- 3. 分析與顯示邏輯 ---
 if ticker:
-    # 顯示目前分析的對象
     st.markdown(f"### 正在分析: **{ticker}**")
     
     with st.spinner(f'正在讀取數據並計算信心值...'):
@@ -80,17 +90,13 @@ if ticker:
     if error_msg:
         st.error(f"發生錯誤: {error_msg}")
     elif df is not None:
-        # 取得數據
         current_price = info.get('currentPrice', 0)
-        
-        # 使用美觀的指標卡顯示價格
         st.metric(label="當前股價 (USD)", value=f"${current_price:.2f}")
 
-        # --- 信心值邏輯 ---
         confidence_score = 0
         reasons = []
 
-        # A. RSI
+        # [指標 1] RSI (技術面)
         df['RSI'] = ta.rsi(df['Close'], length=14)
         if not df['RSI'].empty:
             current_rsi = df['RSI'].iloc[-1]
@@ -104,20 +110,24 @@ if ticker:
                 confidence_score += 10
                 reasons.append(f"ℹ️ RSI 中性 ({current_rsi:.1f})")
 
-        # B. 本益比
+        # [指標 2] 本益比 (基本面) - 這裡現在保證會有值，或是優雅跳過
         pe_ratio = info.get('trailingPE')
-        if pe_ratio and pe_ratio is not None:
+        
+        if pe_ratio is not None:
+            # 針對科技股稍微放寬標準
             if pe_ratio < 25: 
                 confidence_score += 30
-                reasons.append(f"✅ 本益比 ({pe_ratio:.1f}) 合理")
-            elif pe_ratio > 60: # 科技股容忍度調高一點
-                 reasons.append(f"⚠️ 本益比 ({pe_ratio:.1f}) 偏高")
+                reasons.append(f"✅ 本益比 ({pe_ratio:.1f}) 處於合理/低估區間")
+            elif pe_ratio > 60:
+                 reasons.append(f"⚠️ 本益比 ({pe_ratio:.1f}) 偏高，溢價風險大")
             else:
-                reasons.append(f"ℹ️ 本益比 ({pe_ratio:.1f})")
+                reasons.append(f"ℹ️ 本益比 ({pe_ratio:.1f}) 屬於正常範圍")
         else:
-             reasons.append("ℹ️ 無法取得本益比數據，略過評分")
+             # 真的算不出來時，給一個基本分，不要讓它變 0 分
+             confidence_score += 10 
+             reasons.append("⚠️ 無法取得本益比數據 (可能為虧損公司)，暫不列入評分")
         
-        # C. 均線
+        # [指標 3] 均線 (趨勢面)
         if len(df) > 50:
             ma_50 = df['Close'].rolling(50).mean().iloc[-1]
             if current_price > ma_50:
@@ -128,10 +138,8 @@ if ticker:
 
         # --- 顯示結果 ---
         st.divider()
-        st.subheader(f"🤖 購入信心分數: {confidence_score} / 100")
-        
-        # 進度條視覺化
-        st.progress(max(0, min(100, confidence_score)))
+        st.subheader(f"🤖 購入信心分數: {int(confidence_score)} / 100")
+        st.progress(max(0, min(100, int(confidence_score))))
 
         if confidence_score >= 70:
             st.success("評級: 強力買入 (Strong Buy)")
