@@ -93,10 +93,8 @@ def get_pe_ratio_robust(ticker_symbol, current_price):
                         temp_pe = current_price / ttm_eps_adj
                         
                         # [TSM 關鍵修正]
-                        # 如果算出來 PE < 10 (例如 5.7)，代表我們多乘了一次 5 倍
-                        # 或是 Yahoo 已經給了我們 ADR 的 EPS
                         if ticker_symbol == 'TSM' and temp_pe < 10:
-                            pe = temp_pe * 5.0  # 還原正常值
+                            pe = temp_pe * 5.0
                         else:
                             pe = temp_pe
 
@@ -266,11 +264,39 @@ with col2:
             with st.expander("📊 查看詳細分析報告", expanded=True):
                 for r in reasons: st.write(r)
 
+            # --- 繪圖區 (手機優化版) ---
             titles = (f'{target_ticker} K線圖', '成交量')
-            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], vertical_spacing=0.05, subplot_titles=titles)
+            fig = make_subplots(
+                rows=2, 
+                cols=1, 
+                shared_xaxes=True, 
+                row_heights=[0.7, 0.3], 
+                vertical_spacing=0.05, 
+                subplot_titles=titles
+            )
+            
+            # K線圖
             fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='Price'), row=1, col=1)
+            
+            # 50MA
             fig.add_trace(go.Scatter(x=df.index, y=ma50, line=dict(color='orange', width=1.5), name='50 MA'), row=1, col=1)
+            
+            # 成交量
             colors = ['green' if o < c else 'red' for o, c in zip(df['Open'], df['Close'])]
             fig.add_trace(go.Bar(x=df.index, y=df['Volume'], marker_color=colors, name='Volume'), row=2, col=1)
-            fig.update_layout(height=500, xaxis_rangeslider_visible=False, showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
+
+            # --- 關鍵修正設定 ---
+            fig.update_layout(
+                height=500, 
+                xaxis_rangeslider_visible=False, 
+                showlegend=False,
+                dragmode=False,        # 1. 禁止圖表拖曳模式，讓手指滑動變回捲動網頁
+                hovermode='x unified', # 2. 優化觸控體驗：手指按住一點顯示所有數據
+                yaxis=dict(fixedrange=True),  # 3. 鎖定 Y 軸縮放，防止垂直捲動被圖表吃掉
+                yaxis2=dict(fixedrange=True)  # 鎖定成交量圖的 Y 軸
+            )
+            
+            # config 設定隱藏選單
+            st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False, 'scrollZoom': False})
+    else:
+        st.warning(f"無法載入 {target_ticker} 的數據，請檢查代碼是否正確。")
